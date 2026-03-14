@@ -113,94 +113,106 @@ function serializeJob(job) {
 
 async function executeSingleJob(jobId) {
   clearJobTimer(jobId);
-  const job = await getJob(jobId);
-  if (!job || ["completed", "failed"].includes(job.status)) {
-    return;
-  }
-
-  await updateJob(jobId, {
-    status: "running",
-    nextRunAt: null,
-    startedAt: new Date().toISOString(),
-    error: null,
-  });
-
   try {
-    await sendEmail(job.recipient);
+    const job = await getJob(jobId);
+    if (!job || ["completed", "failed"].includes(job.status)) {
+      return;
+    }
+
     await updateJob(jobId, {
-      status: "completed",
-      completedAt: new Date().toISOString(),
+      status: "running",
+      nextRunAt: null,
+      startedAt: new Date().toISOString(),
       error: null,
     });
+
+    try {
+      await sendEmail(job.recipient);
+      await updateJob(jobId, {
+        status: "completed",
+        completedAt: new Date().toISOString(),
+        error: null,
+      });
+    } catch (error) {
+      await updateJob(jobId, {
+        status: "failed",
+        completedAt: new Date().toISOString(),
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
   } catch (error) {
-    await updateJob(jobId, {
-      status: "failed",
-      completedAt: new Date().toISOString(),
-      error: error instanceof Error ? error.message : "Unknown error",
-    });
+    console.error(`executeSingleJob(${jobId}) unexpected error:`, error instanceof Error ? error.message : error);
+    await updateJob(jobId, { status: "failed", completedAt: new Date().toISOString(), error: "Unexpected scheduler error" }).catch(() => {});
   }
 }
 
 async function executeBulkJob(jobId) {
   clearJobTimer(jobId);
-  const job = await getJob(jobId);
-  if (!job || ["completed", "completed_with_errors", "failed"].includes(job.status)) {
-    return;
-  }
-
-  const processed = Number(job.processed || 0);
-  const total = Number(job.total || 0);
-  if (processed >= total) {
-    await updateJob(jobId, {
-      status: (job.results || []).some((item) => item.status === "failed") ? "completed_with_errors" : "completed",
-      completedAt: new Date().toISOString(),
-      nextRunAt: null,
-    });
-    return;
-  }
-
-  const recipient = job.recipients[processed];
-  const results = Array.isArray(job.results) ? [...job.results] : [];
-
-  await updateJob(jobId, {
-    status: "running",
-    nextRunAt: null,
-    startedAt: job.startedAt || new Date().toISOString(),
-    error: null,
-  });
-
   try {
-    await sendEmail(recipient);
-    results.push({ email: recipient.email, status: "sent" });
-  } catch (error) {
-    results.push({
-      email: recipient.email,
-      status: "failed",
-      error: error instanceof Error ? error.message : "Unknown error",
-    });
-  }
+    const job = await getJob(jobId);
+    if (!job || ["completed", "completed_with_errors", "failed"].includes(job.status)) {
+      return;
+    }
 
-  const nextProcessed = processed + 1;
-  if (nextProcessed >= total) {
+    const processed = Number(job.processed || 0);
+    const total = Number(job.total || 0);
+    if (processed >= total) {
+      await updateJob(jobId, {
+        status: (job.results || []).some((item) => item.status === "failed") ? "completed_with_errors" : "completed",
+        completedAt: new Date().toISOString(),
+        nextRunAt: null,
+      });
+      return;
+    }
+
+    const recipient = job.recipients[processed];
+    const results = Array.isArray(job.results) ? [...job.results] : [];
+
+    await updateJob(jobId, {
+      status: "running",
+      nextRunAt: null,
+      startedAt: job.startedAt || new Date().toISOString(),
+      error: null,
+    });
+
+    // Email failure must NOT stop the bulk campaign — log and continue
+    try {
+      await sendEmail(recipient);
+      results.push({ email: recipient.email, status: "sent" });
+    } catch (error) {
+      console.error(`Bulk email failed for ${recipient.email}:`, error instanceof Error ? error.message : error);
+      results.push({
+        email: recipient.email,
+        status: "failed",
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+
+    const nextProcessed = processed + 1;
+    if (nextProcessed >= total) {
+      await updateJob(jobId, {
+        processed: nextProcessed,
+        results,
+        status: results.some((item) => item.status === "failed") ? "completed_with_errors" : "completed",
+        completedAt: new Date().toISOString(),
+        nextRunAt: null,
+      });
+      return;
+    }
+
+    const nextRunAt = new Date(Date.now() + Number(job.intervalSeconds || 1) * 1000).toISOString();
     await updateJob(jobId, {
       processed: nextProcessed,
       results,
-      status: results.some((item) => item.status === "failed") ? "completed_with_errors" : "completed",
-      completedAt: new Date().toISOString(),
-      nextRunAt: null,
+      status: "scheduled",
+      nextRunAt,
     });
-    return;
+
+    scheduleJob(jobId, new Date(nextRunAt), "bulk");
+  } catch (error) {
+    console.error(`executeBulkJob(${jobId}) unexpected error:`, error instanceof Error ? error.message : error);
+    await updateJob(jobId, { status: "failed", completedAt: new Date().toISOString(), error: "Unexpected scheduler error" }).catch(() => {});
   }
-
-  const nextRunAt = new Date(Date.now() + Number(job.intervalSeconds || 1) * 1000).toISOString();
-  await updateJob(jobId, {
-    processed: nextProcessed,
-    results,
-    status: "scheduled",
-    nextRunAt,
-  });
-
-  scheduleJob(jobId, new Date(nextRunAt), "bulk");
 }
 
 function scheduleJob(jobId, runAt, type) {

@@ -92,11 +92,6 @@ export default function Home() {
 
   useEffect(() => {
     void fetchJobs();
-    const timer = setInterval(() => {
-      void fetchJobs();
-    }, 3000);
-
-    return () => clearInterval(timer);
   }, [fetchJobs]);
 
   const parseCSV = useCallback((file: File) => {
